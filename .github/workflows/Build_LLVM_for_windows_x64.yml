@@ -18,7 +18,7 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4.1.7
       with:
-        ssh-key: '${{secrets.CORE_SSH_PRIVATE_KEY}}'
+        token: '${{secrets.PAT}}'
         submodules: 'recursive'
 
     - name: Setup python
