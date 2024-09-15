@@ -51,7 +51,7 @@ jobs:
 
     - name: Zip LLVM
       run: |
-        7z a -y llvm_obf_Win64.zip ./llvm_install/*
+        7z a -y ${{github.workspace}}/build/llvm_obf_Win64.zip ${{github.workspace}}/build/llvm_install/*
         
     - name: Upload a Build Artifact
       uses: actions/upload-artifact@v4.4.0
