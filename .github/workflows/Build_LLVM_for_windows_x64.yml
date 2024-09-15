@@ -18,7 +18,7 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4.1.7
       with:
-        token: '${{secrets.PAT}}'
+        token: ${{secrets.PAT}}
         submodules: 'recursive'
 
     - name: Setup python
