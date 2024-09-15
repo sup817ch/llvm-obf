@@ -1,0 +1,3 @@
+[submodule "llvm/lib/Transforms/llvm-obf-core"]
+	path = llvm/lib/Transforms/llvm-obf-core
+	url = https://github.com/sup817ch/llvm-obf-core.git
