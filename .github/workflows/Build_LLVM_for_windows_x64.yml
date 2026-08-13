@@ -58,12 +58,68 @@ jobs:
         cd ${{github.workspace}}/build
         ninja install
 
-    - name: Zip LLVM
+    - name: Zip LLVM for Visual Studio
+      shell: pwsh
       run: |
-        7z a -y ${{github.workspace}}/build/llvm_obf_Win64.zip ${{github.workspace}}/build/llvm_install/*
-        
-    - name: Upload a Build Artifact
+        $installDir = "${{github.workspace}}/build/llvm_install"
+        $packageDir = "${{github.workspace}}/build/llvm_vs_install"
+        $archivePath = "${{github.workspace}}/build/llvm_obf_Win64_VS_Minimal.zip"
+        $packageBinDir = Join-Path $packageDir "bin"
+        $readmePath = "${{github.workspace}}/llvm/lib/Transforms/llvm-obf-core/README.md"
+
+        New-Item -ItemType Directory -Force -Path $packageBinDir | Out-Null
+
+        if (-not (Test-Path -LiteralPath $readmePath -PathType Leaf)) {
+          throw "llvm-obf-core README is missing: $readmePath"
+        }
+        Copy-Item -LiteralPath $readmePath -Destination $packageDir
+
+        foreach ($tool in @("clang-cl.exe", "lld-link.exe", "llvm-lib.exe")) {
+          $toolPath = Join-Path $installDir "bin/$tool"
+          if (-not (Test-Path -LiteralPath $toolPath -PathType Leaf)) {
+            throw "Required Visual Studio tool is missing: $toolPath"
+          }
+          Copy-Item -LiteralPath $toolPath -Destination $packageBinDir
+        }
+
+        $clangCl = Join-Path $installDir "bin/clang-cl.exe"
+        $resourceDir = (& $clangCl -print-resource-dir).Trim()
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($resourceDir)) {
+          throw "Unable to locate the Clang resource directory"
+        }
+
+        $resourceIncludeDir = Join-Path $resourceDir "include"
+        if (-not (Test-Path -LiteralPath $resourceIncludeDir -PathType Container)) {
+          throw "Clang resource headers are missing: $resourceIncludeDir"
+        }
+
+        $resourceVersion = Split-Path -Leaf $resourceDir
+        $packageResourceDir = Join-Path $packageDir "lib/clang/$resourceVersion"
+        New-Item -ItemType Directory -Force -Path $packageResourceDir | Out-Null
+        Copy-Item -LiteralPath $resourceIncludeDir -Destination $packageResourceDir -Recurse
+
+        7z a -y $archivePath "$packageDir/*"
+        if ($LASTEXITCODE -ne 0) {
+          throw "Failed to create the Visual Studio package"
+        }
+        7z t $archivePath
+        if ($LASTEXITCODE -ne 0) {
+          throw "The Visual Studio package is invalid"
+        }
+
+    - name: Upload Visual Studio Build Artifact
       uses: actions/upload-artifact@v4.4.0
       with:
-        name: llvm_obf_Win64.zip
-        path: ${{github.workspace}}/build/llvm_obf_Win64.zip
+        name: llvm_obf_Win64_VS_Minimal.zip
+        path: ${{github.workspace}}/build/llvm_obf_Win64_VS_Minimal.zip
+
+    # The full installation package is temporarily disabled.
+    # - name: Zip LLVM
+    #   run: |
+    #     7z a -y ${{github.workspace}}/build/llvm_obf_Win64.zip ${{github.workspace}}/build/llvm_install/*
+
+    # - name: Upload a Build Artifact
+    #   uses: actions/upload-artifact@v4.4.0
+    #   with:
+    #     name: llvm_obf_Win64.zip
+    #     path: ${{github.workspace}}/build/llvm_obf_Win64.zip
