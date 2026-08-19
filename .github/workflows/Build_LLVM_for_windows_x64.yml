@@ -1,125 +1,196 @@
 name: Build LLVM for windows x64
 
 on:
+  schedule:
+    - cron: '17 2 * * *'
   workflow_dispatch:
 
+concurrency:
+  group: build-llvm-windows-x64
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 env:
-  # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
   BUILD_TYPE: MinSizeRel
+  TARGET_REPOSITORY: sup817ch/llvm-obf-core
+  NIGHTLY_TAG: nightly
 
 jobs:
-  build:
-    # The CMake configure and build commands are platform agnostic and should work equally well on Windows or Mac.
-    # You can convert this to a matrix build if you need cross-platform coverage.
-    # See: https://docs.github.com/en/free-pro-team@latest/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
-    runs-on: windows-latest
-
+  preflight:
+    name: Check release state
+    runs-on: ubuntu-24.04
+    outputs:
+      should-build: ${{ steps.state.outputs.should-build }}
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4.1.7
-      with:
-        token: ${{secrets.PAT}}
-        submodules: 'recursive'
+      - name: Inspect published assets
+        id: state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "source SHA must be a 40-character lowercase commit SHA" >&2
+            exit 1
+          fi
 
-    - name: Setup python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.12"
+          should_build=true
+          if release_json=$(gh api "repos/$TARGET_REPOSITORY/releases/tags/$NIGHTLY_TAG" 2>/dev/null); then
+            release_id=$(jq -r '.id' <<< "$release_json")
+            asset_names=$(gh api --paginate "repos/$TARGET_REPOSITORY/releases/$release_id/assets?per_page=100" --jq '.[] | select(.state == "uploaded") | .name')
+            escaped_branch=$(printf '%s' "$SOURCE_BRANCH" | sed 's/[^A-Za-z0-9._-]/-/g; s/[][(){}.^$*+?|\\]/\\&/g')
+            if grep -E -q \
+              "^llvm_obf_Win64_VS_Minimal-$escaped_branch-$SOURCE_SHA-[0-9]{8}T[0-9]{9}Z\\.zip$" \
+              <<< "$asset_names"; then
+              should_build=false
+              echo "The current commit is already published; skipping the build."
+            fi
+          else
+            echo "The nightly release does not exist yet; it will be created after the build."
+          fi
+          echo "should-build=$should_build" >> "$GITHUB_OUTPUT"
 
-    - name: Install ninja-build tool
-      uses: seanmiddleditch/gha-setup-ninja@v5
-      with:
-        version: "1.12.1"
+  build:
+    name: Build and publish Windows x64 package
+    needs: preflight
+    if: needs.preflight.outputs.should-build == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.1.7
+        with:
+          ref: ${{ github.sha }}
+          token: ${{ github.token }}
+          submodules: recursive
 
-    - name: Visual Studio shell
-      uses: egor-tensin/vs-shell@v2
-      with:
-        arch: x64
-
-    - name: Configure CMake
-      # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
-      # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
-      run: |
-        cmake -G Ninja -S ${{github.workspace}}/llvm -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DLLVM_TARGETS_TO_BUILD=X86 -DLLVM_ENABLE_PROJECTS="clang;lld" -DCMAKE_INSTALL_PREFIX="${{github.workspace}}/build/llvm_install" -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_UTILS=OFF -DLLVM_INCLUDE_RUNTIMES=OFF -DLLVM_INCLUDE_DOCS=OFF -DLLVM_OBFUSCATION_LINK_INTO_TOOLS=ON -DLLVM_OBFUSCATION_INCLUDE_TESTS=ON -DCMAKE_CXX_FLAGS="/sdl-"
-
-    - name: Build
-      # Build your program with the given configuration
-      run: |
-        cd ${{github.workspace}}/build
-        ninja
-
-    - name: Test llvm-obf-core
-      run: |
-        cd ${{github.workspace}}/build
-        ninja check-llvm-obf-core
-
-    - name: Install
-      run: |
-        cd ${{github.workspace}}/build
-        ninja install
-
-    - name: Zip LLVM for Visual Studio
-      shell: pwsh
-      run: |
-        $installDir = "${{github.workspace}}/build/llvm_install"
-        $packageDir = "${{github.workspace}}/build/llvm_vs_install"
-        $archivePath = "${{github.workspace}}/build/llvm_obf_Win64_VS_Minimal.zip"
-        $packageBinDir = Join-Path $packageDir "bin"
-        $readmePath = "${{github.workspace}}/llvm/lib/Transforms/llvm-obf-core/README.md"
-
-        New-Item -ItemType Directory -Force -Path $packageBinDir | Out-Null
-
-        if (-not (Test-Path -LiteralPath $readmePath -PathType Leaf)) {
-          throw "llvm-obf-core README is missing: $readmePath"
-        }
-        Copy-Item -LiteralPath $readmePath -Destination $packageDir
-
-        foreach ($tool in @("clang-cl.exe", "lld-link.exe", "llvm-lib.exe")) {
-          $toolPath = Join-Path $installDir "bin/$tool"
-          if (-not (Test-Path -LiteralPath $toolPath -PathType Leaf)) {
-            throw "Required Visual Studio tool is missing: $toolPath"
+      - name: Verify checkout
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -cne $env:SOURCE_SHA) {
+            throw "Checked out $actual instead of requested $env:SOURCE_SHA"
           }
-          Copy-Item -LiteralPath $toolPath -Destination $packageBinDir
-        }
+          $core = (git -C llvm/lib/Transforms/llvm-obf-core rev-parse HEAD).Trim()
+          "Root commit: $actual" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "llvm-obf-core commit: $core" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
-        $clangCl = Join-Path $installDir "bin/clang-cl.exe"
-        $resourceDir = (& $clangCl -print-resource-dir).Trim()
-        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($resourceDir)) {
-          throw "Unable to locate the Clang resource directory"
-        }
+      - name: Setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-        $resourceIncludeDir = Join-Path $resourceDir "include"
-        if (-not (Test-Path -LiteralPath $resourceIncludeDir -PathType Container)) {
-          throw "Clang resource headers are missing: $resourceIncludeDir"
-        }
+      - name: Install ninja-build tool
+        uses: seanmiddleditch/gha-setup-ninja@v5
+        with:
+          version: "1.12.1"
 
-        $resourceVersion = Split-Path -Leaf $resourceDir
-        $packageResourceDir = Join-Path $packageDir "lib/clang/$resourceVersion"
-        New-Item -ItemType Directory -Force -Path $packageResourceDir | Out-Null
-        Copy-Item -LiteralPath $resourceIncludeDir -Destination $packageResourceDir -Recurse
+      - name: Visual Studio shell
+        uses: egor-tensin/vs-shell@v2
+        with:
+          arch: x64
 
-        7z a -y $archivePath "$packageDir/*"
-        if ($LASTEXITCODE -ne 0) {
-          throw "Failed to create the Visual Studio package"
-        }
-        7z t $archivePath
-        if ($LASTEXITCODE -ne 0) {
-          throw "The Visual Studio package is invalid"
-        }
+      - name: Configure CMake
+        run: |
+          cmake -G Ninja -S ${{ github.workspace }}/llvm -B ${{ github.workspace }}/build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DLLVM_TARGETS_TO_BUILD=X86 -DLLVM_ENABLE_PROJECTS="clang;lld" -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/build/llvm_install" -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_UTILS=OFF -DLLVM_INCLUDE_RUNTIMES=OFF -DLLVM_INCLUDE_DOCS=OFF -DLLVM_OBFUSCATION_LINK_INTO_TOOLS=ON -DLLVM_OBFUSCATION_INCLUDE_TESTS=ON -DCMAKE_CXX_FLAGS="/sdl-"
 
-    - name: Upload Visual Studio Build Artifact
-      uses: actions/upload-artifact@v4.4.0
-      with:
-        name: llvm_obf_Win64_VS_Minimal.zip
-        path: ${{github.workspace}}/build/llvm_obf_Win64_VS_Minimal.zip
+      - name: Build
+        run: ninja -C ${{ github.workspace }}/build
 
-    # The full installation package is temporarily disabled.
-    # - name: Zip LLVM
-    #   run: |
-    #     7z a -y ${{github.workspace}}/build/llvm_obf_Win64.zip ${{github.workspace}}/build/llvm_install/*
+      - name: Test llvm-obf-core
+        run: ninja -C ${{ github.workspace }}/build check-llvm-obf-core
 
-    # - name: Upload a Build Artifact
-    #   uses: actions/upload-artifact@v4.4.0
-    #   with:
-    #     name: llvm_obf_Win64.zip
-    #     path: ${{github.workspace}}/build/llvm_obf_Win64.zip
+      - name: Install
+        run: ninja -C ${{ github.workspace }}/build install
+
+      - name: Package Windows Visual Studio tools
+        id: package
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_BRANCH: ${{ github.ref_name }}
+        run: |
+          $installDir = "${{ github.workspace }}/build/llvm_install"
+          $packageDir = "${{ github.workspace }}/build/llvm_vs_install"
+          $archivePath = "${{ github.workspace }}/build/llvm_obf_Win64_VS_Minimal.zip"
+          $packageBinDir = Join-Path $packageDir "bin"
+          $readmePath = "${{ github.workspace }}/llvm/lib/Transforms/llvm-obf-core/README.md"
+          New-Item -ItemType Directory -Force -Path $packageBinDir | Out-Null
+          if (-not (Test-Path -LiteralPath $readmePath -PathType Leaf)) { throw "llvm-obf-core README is missing: $readmePath" }
+          Copy-Item -LiteralPath $readmePath -Destination $packageDir
+          foreach ($tool in @("clang-cl.exe", "lld-link.exe", "llvm-lib.exe")) {
+            $toolPath = Join-Path $installDir "bin/$tool"
+            if (-not (Test-Path -LiteralPath $toolPath -PathType Leaf)) { throw "Required Visual Studio tool is missing: $toolPath" }
+            Copy-Item -LiteralPath $toolPath -Destination $packageBinDir
+          }
+          $clangCl = Join-Path $installDir "bin/clang-cl.exe"
+          $resourceDir = (& $clangCl -print-resource-dir).Trim()
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($resourceDir)) { throw "Unable to locate the Clang resource directory" }
+          $resourceIncludeDir = Join-Path $resourceDir "include"
+          if (-not (Test-Path -LiteralPath $resourceIncludeDir -PathType Container)) { throw "Clang resource headers are missing: $resourceIncludeDir" }
+          $resourceVersion = Split-Path -Leaf $resourceDir
+          $packageResourceDir = Join-Path $packageDir "lib/clang/$resourceVersion"
+          New-Item -ItemType Directory -Force -Path $packageResourceDir | Out-Null
+          Copy-Item -LiteralPath $resourceIncludeDir -Destination $packageResourceDir -Recurse
+          7z a -y $archivePath "$packageDir/*"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to create the Visual Studio package" }
+          7z t $archivePath
+          if ($LASTEXITCODE -ne 0) { throw "The Visual Studio package is invalid" }
+          $timestamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssfffZ")
+          $safeBranch = $env:SOURCE_BRANCH -replace '[^A-Za-z0-9._-]', '-'
+          $packageName = "llvm_obf_Win64_VS_Minimal-$safeBranch-$($env:SOURCE_SHA)-$timestamp.zip"
+          $releasePath = Join-Path "${{ github.workspace }}/build" $packageName
+          Move-Item -LiteralPath $archivePath -Destination $releasePath
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $releasePath).Hash.ToLowerInvariant()
+          "Package: $packageName" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "SHA-256: $hash" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "package-name=$packageName" >> $env:GITHUB_OUTPUT
+
+      - name: Publish package to llvm-obf-core
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          SOURCE_SHA: ${{ github.sha }}
+          PACKAGE_NAME: ${{ steps.package.outputs.package-name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $releaseEndpoint = "repos/$env:TARGET_REPOSITORY/releases/tags/$env:NIGHTLY_TAG"
+          $releaseJson = gh api $releaseEndpoint 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            $targetBranch = gh api "repos/$env:TARGET_REPOSITORY" --jq '.default_branch'
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($targetBranch)) { throw 'Unable to resolve the llvm-obf-core default branch.' }
+            gh api --method POST "repos/$env:TARGET_REPOSITORY/releases" `
+              -f tag_name=$env:NIGHTLY_TAG `
+              -f target_commitish=$targetBranch `
+              -f name='LLVM Obfuscation Windows Nightly Builds' `
+              -f body='Automated Windows x64 builds from sup817ch/llvm-obf.' `
+              -F prerelease=true -F draft=false | Out-Null
+            $releaseJson = gh api $releaseEndpoint
+          }
+          $release = $releaseJson | ConvertFrom-Json
+          if ($release.draft -or -not $release.prerelease) { throw 'The existing nightly release must be a published prerelease.' }
+          $assetPath = Join-Path "${{ github.workspace }}/build" $env:PACKAGE_NAME
+          $asset = $release.assets | Where-Object name -eq $env:PACKAGE_NAME
+          if ($asset) {
+            if ($asset.state -ne 'uploaded' -or $asset.size -ne (Get-Item $assetPath).Length) { throw 'An existing asset has the wrong state or size.' }
+          } else {
+            gh release upload $env:NIGHTLY_TAG $assetPath --repo $env:TARGET_REPOSITORY
+            $release = (gh api $releaseEndpoint | ConvertFrom-Json)
+            $asset = $release.assets | Where-Object name -eq $env:PACKAGE_NAME
+            if (-not $asset -or $asset.state -ne 'uploaded') { throw 'The uploaded asset could not be verified.' }
+          }
+          $pattern = '^llvm_obf_Win64_VS_Minimal-.+-[0-9a-f]{40}-[0-9]{8}T[0-9]{9}Z\.zip$'
+          $productAssets = @($release.assets | Where-Object { $_.state -eq 'uploaded' -and $_.name -match $pattern } | Sort-Object @{Expression={[DateTime]$_.created_at}; Descending=$true}, @{Expression={[int64]$_.id}; Descending=$true})
+          foreach ($oldAsset in ($productAssets | Select-Object -Skip 10)) {
+            gh api --method DELETE "repos/$env:TARGET_REPOSITORY/releases/assets/$($oldAsset.id)" | Out-Null
+          }
+          $remaining = @((gh api $releaseEndpoint | ConvertFrom-Json).assets | Where-Object { $_.state -eq 'uploaded' -and $_.name -match $pattern }).Count
+          if ($remaining -gt 10) { throw "Retention verification failed: $remaining product assets remain." }
+          "Nightly release: https://github.com/$env:TARGET_REPOSITORY/releases/tag/$env:NIGHTLY_TAG" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          "Published root SHA: $env:SOURCE_SHA" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          "Retained product assets: $remaining" | Out-File $env:GITHUB_STEP_SUMMARY -Append
