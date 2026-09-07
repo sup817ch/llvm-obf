@@ -1,0 +1,163 @@
+name: Test LLVM nightly for windows x64
+
+on:
+  schedule:
+    # Run every hour, away from the busy start of the hour (UTC).
+    - cron: '37 * * * *'
+  workflow_dispatch:
+    inputs:
+      aes_seed:
+        description: 'Optional 32-digit hexadecimal AES seed to reproduce a test run'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: test-llvm-nightly-windows-x64
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TARGET_REPOSITORY: sup817ch/llvm-obf-core
+  NIGHTLY_TAG: nightly
+  PACKAGE_NAME: llvm_obf_Win64_VS_Minimal.zip
+
+jobs:
+  test:
+    name: Test published Windows x64 package
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Download nightly package
+        id: nightly
+        env:
+          GH_TOKEN: ${{ secrets.PAT || github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $releaseJson = gh api "repos/$env:TARGET_REPOSITORY/releases/tags/$env:NIGHTLY_TAG"
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to read the nightly release.' }
+          $release = $releaseJson | ConvertFrom-Json
+          $assets = @($release.assets | Where-Object name -eq $env:PACKAGE_NAME)
+          if ($assets.Count -ne 1 -or $assets[0].state -ne 'uploaded') {
+            throw "The nightly release does not contain an uploaded $env:PACKAGE_NAME."
+          }
+          $asset = $assets[0]
+
+          # The build workflow records the exact core revision after publishing.
+          # Pin the tests to it instead of testing a moving branch or tag.
+          if ($release.body -notmatch '(?m)^Nightly tag commit: ([0-9a-fA-F]{40})\s*$') {
+            throw 'The nightly release is missing its published llvm-obf-core commit.'
+          }
+          $coreSha = $Matches[1]
+          $downloadDir = Join-Path $env:RUNNER_TEMP 'llvm-nightly-download'
+          New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
+          gh release download $env:NIGHTLY_TAG --repo $env:TARGET_REPOSITORY `
+            --pattern $env:PACKAGE_NAME --dir $downloadDir
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download the nightly package.' }
+          $archivePath = Join-Path $downloadDir $env:PACKAGE_NAME
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash.ToLowerInvariant()
+          if ((Get-Item -LiteralPath $archivePath).Length -ne $asset.size -or
+              ($asset.digest -and $asset.digest -ne "sha256:$hash")) {
+            throw 'The downloaded package differs from the release asset; the nightly release may have changed. Rerun the workflow.'
+          }
+
+          $resultsDir = Join-Path $env:GITHUB_WORKSPACE 'nightly-test-results'
+          New-Item -ItemType Directory -Force -Path $resultsDir | Out-Null
+          $runInfo = @(
+            "Release: $($release.html_url)"
+            "Package: $env:PACKAGE_NAME"
+            "Asset ID: $($asset.id)"
+            "SHA-256: $hash"
+            "Test source commit: $coreSha"
+            $release.body
+          )
+          $runInfo | Set-Content -LiteralPath (Join-Path $resultsDir 'run-info.txt')
+          $runInfo | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "core-sha=$coreSha" >> $env:GITHUB_OUTPUT
+          "archive-path=$archivePath" >> $env:GITHUB_OUTPUT
+
+      - name: Checkout tests matching the nightly package
+        uses: actions/checkout@v4.1.7
+        with:
+          repository: ${{ env.TARGET_REPOSITORY }}
+          ref: ${{ steps.nightly.outputs.core-sha }}
+          token: ${{ secrets.PAT || github.token }}
+          persist-credentials: false
+          sparse-checkout: test
+          path: llvm-obf-core
+
+      - name: Visual Studio shell
+        uses: egor-tensin/vs-shell@v2
+        with:
+          arch: x64
+
+      - name: Prepare published compiler
+        env:
+          ARCHIVE_PATH: ${{ steps.nightly.outputs.archive-path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packageDir = Join-Path $env:RUNNER_TEMP 'llvm-nightly'
+          7z x -y $env:ARCHIVE_PATH "-o$packageDir"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to extract the nightly package.' }
+          $binDir = Join-Path $packageDir 'bin'
+          foreach ($tool in @('clang-cl.exe', 'lld-link.exe', 'llvm-lib.exe')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $binDir $tool) -PathType Leaf)) {
+              throw "Required tool is missing from the nightly package: $tool"
+            }
+          }
+
+          # Clang selects its driver mode from the executable name. The existing
+          # test suite uses clang's GNU-style arguments, not clang-cl's CL mode.
+          $clang = Join-Path $binDir 'clang.exe'
+          Copy-Item -LiteralPath (Join-Path $binDir 'clang-cl.exe') -Destination $clang
+          & $clang --version
+          if ($LASTEXITCODE -ne 0) { throw 'The published compiler cannot run.' }
+          $resourceDir = (& $clang -print-resource-dir).Trim()
+          if ($LASTEXITCODE -ne 0 -or
+              -not (Test-Path -LiteralPath (Join-Path $resourceDir 'include') -PathType Container)) {
+            throw 'Clang resource headers are missing from the nightly package.'
+          }
+          "CLANG_EXECUTABLE=$clang" >> $env:GITHUB_ENV
+          $binDir >> $env:GITHUB_PATH
+
+      - name: Run llvm-obf-core tests
+        env:
+          REQUESTED_AES_SEED: ${{ inputs.aes_seed }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $seed = $env:REQUESTED_AES_SEED
+          if ([string]::IsNullOrWhiteSpace($seed)) { $seed = [guid]::NewGuid().ToString('N') }
+          if ($seed -notmatch '\A[0-9a-fA-F]{32}\z') { throw 'aes_seed must contain exactly 32 hexadecimal characters.' }
+          $testDir = Join-Path $env:GITHUB_WORKSPACE 'llvm-obf-core/test'
+          $resultsDir = Join-Path $env:GITHUB_WORKSPACE 'nightly-test-results'
+          "AES seed: $seed" | Add-Content -LiteralPath (Join-Path $resultsDir 'run-info.txt')
+          "AES seed: $seed" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+          # Invoke the same script as check-llvm-obf-core without a build tree.
+          cmake `
+            "-DCLANG_EXECUTABLE=$env:CLANG_EXECUTABLE" `
+            '-DEXECUTABLE_SUFFIX=.exe' `
+            "-DTEST_OUTPUT_DIR=$resultsDir/Output" `
+            "-DTEST_SOURCE=$testDir/ObfuscationSmoke.cpp" `
+            "-DVM_TEST_SOURCE=$testDir/VMObfuscationSmoke.ll" `
+            "-DTEST_AES_SEED=$seed" `
+            -P "$testDir/RunObfuscationTests.cmake" 2>&1 |
+            Tee-Object -FilePath (Join-Path $resultsDir 'test.log')
+          if ($LASTEXITCODE -ne 0) { throw "llvm-obf-core tests failed (AES seed: $seed)." }
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-obf-nightly-windows-x64-test-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            nightly-test-results/run-info.txt
+            nightly-test-results/test.log
+          if-no-files-found: warn
+          retention-days: 7
